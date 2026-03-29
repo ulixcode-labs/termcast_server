@@ -1,0 +1,146 @@
+name: Scan Binary
+
+on:
+  push:
+    paths:
+      - "bin/**"
+      - ".github/workflows/scan-binary.yml"
+  pull_request:
+    paths:
+      - "bin/**"
+      - ".github/workflows/scan-binary.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  trivy-scan:
+    name: Trivy Vulnerability Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract DMG contents
+        run: |
+          sudo apt-get update && sudo apt-get install -y p7zip-full
+          mkdir -p extracted
+          7z x bin/termcast_server.dmg -oextracted || true
+          echo "=== Extracted contents ==="
+          find extracted -type f | head -50
+
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: extracted
+          format: table
+          exit-code: 0
+          severity: CRITICAL,HIGH,MEDIUM
+          scanners: vuln,secret
+
+  clamav-scan:
+    name: ClamAV Malware Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ClamAV and update signatures
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clamav
+          sudo systemctl stop clamav-freshclam || true
+          sudo freshclam
+
+      - name: Scan binary
+        run: |
+          echo "=== Scanning bin/ ==="
+          clamscan --recursive --infected --verbose bin/
+          echo "=== Scan complete ==="
+
+  grype-scan:
+    name: Grype Vulnerability Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract DMG contents
+        run: |
+          sudo apt-get update && sudo apt-get install -y p7zip-full
+          mkdir -p extracted
+          7z x bin/termcast_server.dmg -oextracted || true
+
+      - name: Install Grype
+        run: curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+
+      - name: Run Grype scan
+        run: grype dir:extracted --output table --fail-on critical
+
+  osv-scan:
+    name: OSV Vulnerability Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract DMG and find package metadata
+        run: |
+          sudo apt-get update && sudo apt-get install -y p7zip-full
+          mkdir -p extracted
+          7z x bin/termcast_server.dmg -oextracted || true
+          echo "=== Package files found ==="
+          find extracted -name "package.json" -o -name "package-lock.json" | head -20
+
+      - name: Run OSV-Scanner
+        uses: google/osv-scanner-action/osv-scanner-action@v2.3.5
+        continue-on-error: true
+        with:
+          scan-args: |-
+            --recursive
+            extracted
+
+  checksum:
+    name: Generate Checksums
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate checksums
+        run: |
+          echo "=== SHA-256 Checksums ==="
+          sha256sum bin/*
+          echo ""
+          echo "=== File sizes ==="
+          ls -lh bin/*
+
+      - name: Verify DMG integrity
+        run: |
+          file bin/termcast_server.dmg
+          file bin/termcast_server.dmg | grep -q "compressed" && echo "Valid compressed image" || echo "Warning: unexpected file type"
+
+  codesign-verify:
+    name: Verify Code Signature
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Mount and verify DMG
+        run: |
+          echo "=== Mounting DMG ==="
+          hdiutil attach bin/termcast_server.dmg -nobrowse -mountpoint /tmp/termcast_dmg
+
+          echo ""
+          echo "=== Code signature ==="
+          codesign --verify --deep --strict --verbose=2 /tmp/termcast_dmg/Termcast.app 2>&1 || true
+
+          echo ""
+          echo "=== Signing identity ==="
+          codesign -dvv /tmp/termcast_dmg/Termcast.app 2>&1 || true
+
+          echo ""
+          echo "=== Notarization check ==="
+          spctl --assess --type execute --verbose /tmp/termcast_dmg/Termcast.app 2>&1 || true
+
+          echo ""
+          echo "=== Gatekeeper check ==="
+          spctl --assess --type open --context context:primary-signature --verbose bin/termcast_server.dmg 2>&1 || true
+
+          hdiutil detach /tmp/termcast_dmg
